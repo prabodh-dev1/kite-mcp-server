@@ -3,6 +3,8 @@ package kc
 import (
 	"io"
 	"log/slog"
+	"os"
+	"path/filepath"
 	"testing"
 
 	"github.com/zerodha/kite-mcp-server/kc/instruments"
@@ -229,16 +231,24 @@ func TestSessionLoginURL(t *testing.T) {
 		t.Fatalf("Expected no error creating manager, got: %v", err)
 	}
 
+	sessionFile := filepath.Join(t.TempDir(), "data.json")
+	t.Setenv("KITE_MCP_SESSION_FILE", sessionFile)
+
 	// Test empty session ID
 	_, err = manager.SessionLoginURL("")
 	if err != ErrInvalidSessionID {
 		t.Errorf("Expected ErrInvalidSessionID for empty session ID, got: %v", err)
 	}
 
-	// Test non-existent session
-	_, err = manager.SessionLoginURL("non-existent-session")
-	if err != ErrSessionNotFound {
-		t.Errorf("Expected ErrSessionNotFound for non-existent session, got: %v", err)
+	// Test external UUID session ID (auto-created on first use)
+	externalSessionID := "6f615000-2644-45a7-a27c-f579e20b5992"
+	externalLoginURL, err := manager.SessionLoginURL(externalSessionID)
+	if err != nil {
+		t.Errorf("Expected no error for external session ID, got: %v", err)
+	}
+
+	if !managerContains(externalLoginURL, "session_id%3D"+externalSessionID) {
+		t.Errorf("Expected login URL to contain external session ID. URL: %s, SessionID: %s", externalLoginURL, externalSessionID)
 	}
 
 	// Test valid session
@@ -252,8 +262,13 @@ func TestSessionLoginURL(t *testing.T) {
 		t.Error("Expected non-empty login URL")
 	}
 
-	if !managerContains(loginURL, "session_id%3D"+sessionID) {
-		t.Errorf("Expected login URL to contain URL-encoded session ID. URL: %s, SessionID: %s", loginURL, sessionID)
+	effectiveSessionID, err := manager.ResolveSessionID(sessionID)
+	if err != nil {
+		t.Fatalf("Expected to resolve effective session ID, got: %v", err)
+	}
+
+	if !managerContains(loginURL, "session_id%3D"+effectiveSessionID) {
+		t.Errorf("Expected login URL to contain URL-encoded effective session ID. URL: %s, EffectiveSessionID: %s", loginURL, effectiveSessionID)
 	}
 }
 
@@ -527,6 +542,163 @@ func TestExternalSessionIDFromErrorLog(t *testing.T) {
 	}
 	if kiteSession2 != kiteSession {
 		t.Error("Expected same session instance to be returned")
+	}
+}
+
+func TestGetOrCreateSessionUsesPersistedSessionID(t *testing.T) {
+	manager, err := newTestManager("test_key", "test_secret")
+	if err != nil {
+		t.Fatalf("Expected no error creating manager, got: %v", err)
+	}
+
+	sessionFile := filepath.Join(t.TempDir(), "data.json")
+	t.Setenv("KITE_MCP_SESSION_FILE", sessionFile)
+
+	sessionID := manager.GenerateSession()
+	if err := manager.saveSessionIDToFile(sessionID); err != nil {
+		t.Fatalf("Expected no error writing persisted session ID, got: %v", err)
+	}
+
+	kiteData, isNew, err := manager.GetOrCreateSession("")
+	if err != nil {
+		t.Fatalf("Expected persisted session ID fallback to work, got error: %v", err)
+	}
+
+	if isNew {
+		t.Error("Expected existing persisted session to be reused")
+	}
+
+	if kiteData == nil || kiteData.Kite == nil {
+		t.Error("Expected non-nil kite session data from persisted session ID")
+	}
+}
+
+func TestGetOrCreateSessionPrefersPersistedActiveSessionOverNewContextSession(t *testing.T) {
+	manager, err := newTestManager("test_key", "test_secret")
+	if err != nil {
+		t.Fatalf("Expected no error creating manager, got: %v", err)
+	}
+
+	sessionFile := filepath.Join(t.TempDir(), "data.json")
+	t.Setenv("KITE_MCP_SESSION_FILE", sessionFile)
+
+	persistedID := manager.GenerateSession()
+	if err := manager.saveSessionIDToFile(persistedID); err != nil {
+		t.Fatalf("Expected no error writing persisted session ID, got: %v", err)
+	}
+
+	otherContextSessionID := manager.SessionManager().Generate()
+	kiteData, isNew, err := manager.GetOrCreateSession(otherContextSessionID)
+	if err != nil {
+		t.Fatalf("Expected no error resolving session from persisted active session, got: %v", err)
+	}
+
+	if isNew {
+		t.Error("Expected existing persisted active session to be reused, got new session")
+	}
+
+	persistedData, err := manager.GetSession(persistedID)
+	if err != nil {
+		t.Fatalf("Expected persisted session to be retrievable, got: %v", err)
+	}
+
+	if kiteData != persistedData {
+		t.Error("Expected GetOrCreateSession to return persisted active session data")
+	}
+}
+
+func TestGetOrCreateSessionAlwaysUsesPersistedSessionIDWhenFileExists(t *testing.T) {
+	manager, err := newTestManager("test_key", "test_secret")
+	if err != nil {
+		t.Fatalf("Expected no error creating manager, got: %v", err)
+	}
+
+	sessionFile := filepath.Join(t.TempDir(), "data.json")
+	t.Setenv("KITE_MCP_SESSION_FILE", sessionFile)
+
+	persistedID := manager.SessionManager().Generate()
+	if err := manager.saveSessionIDToFile(persistedID); err != nil {
+		t.Fatalf("Expected no error writing persisted session ID, got: %v", err)
+	}
+
+	otherContextSessionID := manager.SessionManager().Generate()
+
+	_, isNewFirst, err := manager.GetOrCreateSession(otherContextSessionID)
+	if err != nil {
+		t.Fatalf("Expected no error creating/retrieving via persisted session ID, got: %v", err)
+	}
+	if !isNewFirst {
+		t.Error("Expected first call to initialize data on persisted session ID")
+	}
+
+	_, isNewSecond, err := manager.GetOrCreateSession(otherContextSessionID)
+	if err != nil {
+		t.Fatalf("Expected no error on second call via persisted session ID, got: %v", err)
+	}
+	if isNewSecond {
+		t.Error("Expected second call to reuse persisted session ID data")
+	}
+
+	if _, err := manager.GetSession(persistedID); err != nil {
+		t.Fatalf("Expected persisted session to contain data, got: %v", err)
+	}
+}
+
+func TestSessionLoginURLUsesPersistedSessionID(t *testing.T) {
+	manager, err := newTestManager("test_key", "test_secret")
+	if err != nil {
+		t.Fatalf("Expected no error creating manager, got: %v", err)
+	}
+
+	sessionFile := filepath.Join(t.TempDir(), "data.json")
+	t.Setenv("KITE_MCP_SESSION_FILE", sessionFile)
+
+	sessionID := manager.GenerateSession()
+	if err := manager.saveSessionIDToFile(sessionID); err != nil {
+		t.Fatalf("Expected no error writing persisted session ID, got: %v", err)
+	}
+
+	loginURL, err := manager.SessionLoginURL("")
+	if err != nil {
+		t.Fatalf("Expected SessionLoginURL to use persisted session ID, got error: %v", err)
+	}
+
+	if !managerContains(loginURL, "session_id%3D"+sessionID) {
+		t.Errorf("Expected login URL to contain persisted session ID. URL: %s, SessionID: %s", loginURL, sessionID)
+	}
+}
+
+func TestGetOrCreateSessionEmptyIDWithoutPersistedFile(t *testing.T) {
+	manager, err := newTestManager("test_key", "test_secret")
+	if err != nil {
+		t.Fatalf("Expected no error creating manager, got: %v", err)
+	}
+
+	sessionFile := filepath.Join(t.TempDir(), "data.json")
+	t.Setenv("KITE_MCP_SESSION_FILE", sessionFile)
+
+	_, _, err = manager.GetOrCreateSession("")
+	if err != ErrInvalidSessionID {
+		t.Errorf("Expected ErrInvalidSessionID when no session ID and no persisted file, got: %v", err)
+	}
+}
+
+func TestGetOrCreateSessionEmptyIDWithInvalidPersistedData(t *testing.T) {
+	manager, err := newTestManager("test_key", "test_secret")
+	if err != nil {
+		t.Fatalf("Expected no error creating manager, got: %v", err)
+	}
+
+	sessionFile := filepath.Join(t.TempDir(), "data.json")
+	t.Setenv("KITE_MCP_SESSION_FILE", sessionFile)
+
+	if err := os.WriteFile(sessionFile, []byte(`{"session_id":""}`), 0o600); err != nil {
+		t.Fatalf("Failed to write invalid persisted data: %v", err)
+	}
+
+	_, _, err = manager.GetOrCreateSession("")
+	if err != ErrInvalidSessionID {
+		t.Errorf("Expected ErrInvalidSessionID for invalid persisted session data, got: %v", err)
 	}
 }
 

@@ -2,12 +2,14 @@ package kc
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"html/template"
 	"log/slog"
 	"net/http"
 	"net/url"
+	"os"
 	"time"
 
 	kiteconnect "github.com/zerodha/gokiteconnect/v4"
@@ -93,7 +95,8 @@ func NewKiteConnect(apiKey string) *KiteConnect {
 
 const (
 	// Template names
-	indexTemplate = "login_success.html"
+	indexTemplate        = "login_success.html"
+	persistedSessionFile = "data.json"
 
 	// HTTP error messages
 	missingParamsMessage  = "missing MCP session_id or Kite request_token"
@@ -108,6 +111,11 @@ var (
 
 type KiteSessionData struct {
 	Kite *KiteConnect
+}
+
+type persistedSessionData struct {
+	SessionID string `json:"session_id"`
+	UpdatedAt string `json:"updated_at"`
 }
 
 type Manager struct {
@@ -221,16 +229,104 @@ func (m *Manager) logSessionRetrievedData(sessionID string) {
 	m.Logger.Info("Successfully retrieved Kite data for MCP session ID", "session_id", sessionID)
 }
 
+func (m *Manager) sessionStorePath() string {
+	if path := os.Getenv("KITE_MCP_SESSION_FILE"); path != "" {
+		return path
+	}
+	return persistedSessionFile
+}
+
+func (m *Manager) saveSessionIDToFile(sessionID string) error {
+	if err := m.validateSessionID(sessionID); err != nil {
+		return err
+	}
+
+	payload := persistedSessionData{
+		SessionID: sessionID,
+		UpdatedAt: time.Now().UTC().Format(time.RFC3339),
+	}
+
+	encoded, err := json.Marshal(payload)
+	if err != nil {
+		return fmt.Errorf("failed to marshal session data: %w", err)
+	}
+
+	if err := os.WriteFile(m.sessionStorePath(), encoded, 0o600); err != nil {
+		return fmt.Errorf("failed to write session file: %w", err)
+	}
+
+	return nil
+}
+
+func (m *Manager) loadSessionIDFromFile() (string, error) {
+	encoded, err := os.ReadFile(m.sessionStorePath())
+	if err != nil {
+		return "", err
+	}
+
+	var payload persistedSessionData
+	if err := json.Unmarshal(encoded, &payload); err != nil {
+		return "", fmt.Errorf("failed to parse session file: %w", err)
+	}
+
+	if err := m.validateSessionID(payload.SessionID); err != nil {
+		return "", err
+	}
+
+	return payload.SessionID, nil
+}
+
+func (m *Manager) hasActiveSessionData(sessionID string) bool {
+	if sessionID == "" {
+		return false
+	}
+
+	data, err := m.sessionManager.GetSessionData(sessionID)
+	if err != nil || data == nil {
+		return false
+	}
+
+	kiteData, ok := data.(*KiteSessionData)
+	return ok && kiteData != nil && kiteData.Kite != nil
+}
+
+func (m *Manager) resolveSessionID(mcpSessionID string) (string, error) {
+	persistedSessionID, err := m.loadSessionIDFromFile()
+	if err == nil {
+		if mcpSessionID != "" && persistedSessionID != mcpSessionID {
+			m.Logger.Info("Using persisted MCP session ID from file", "current_session_id", mcpSessionID, "persisted_session_id", persistedSessionID)
+		}
+		return persistedSessionID, nil
+	}
+
+	if mcpSessionID != "" {
+		return mcpSessionID, nil
+	}
+
+	if err != nil {
+		m.Logger.Warn("No persisted MCP session ID available", "error", err)
+		return "", ErrInvalidSessionID
+	}
+
+	return "", ErrInvalidSessionID
+}
+
+// ResolveSessionID returns the effective session ID that will be used by session operations.
+func (m *Manager) ResolveSessionID(mcpSessionID string) (string, error) {
+	return m.resolveSessionID(mcpSessionID)
+}
+
 // GetOrCreateSession retrieves an existing Kite session or creates a new one atomically
 func (m *Manager) GetOrCreateSession(mcpSessionID string) (*KiteSessionData, bool, error) {
-	if err := m.validateSessionID(mcpSessionID); err != nil {
+	resolvedSessionID, err := m.resolveSessionID(mcpSessionID)
+	if err != nil {
 		m.Logger.Warn("GetOrCreateSession called with empty MCP session ID")
-		return nil, false, err
+		return nil, false, ErrInvalidSessionID
 	}
 
 	// Use atomic GetOrCreateSessionData to eliminate TOCTOU race condition
-	data, isNew, err := m.sessionManager.GetOrCreateSessionData(mcpSessionID, func() any {
-		return m.createKiteSessionData(mcpSessionID)
+	data, isNew, err := m.sessionManager.GetOrCreateSessionData(resolvedSessionID, func() any {
+		return m.createKiteSessionData(resolvedSessionID)
 	})
 
 	if err != nil {
@@ -238,15 +334,18 @@ func (m *Manager) GetOrCreateSession(mcpSessionID string) (*KiteSessionData, boo
 		return nil, false, ErrSessionNotFound
 	}
 
-	kiteData, err := m.extractKiteSessionData(data, mcpSessionID)
+	kiteData, err := m.extractKiteSessionData(data, resolvedSessionID)
 	if err != nil {
 		return nil, false, err
 	}
 
 	if isNew {
-		m.logSessionCreated(mcpSessionID)
+		m.logSessionCreated(resolvedSessionID)
+		if err := m.saveSessionIDToFile(resolvedSessionID); err != nil {
+			m.Logger.Warn("Failed to persist newly created MCP session ID", "session_id", resolvedSessionID, "error", err)
+		}
 	} else {
-		m.logSessionRetrieved(mcpSessionID)
+		m.logSessionRetrieved(resolvedSessionID)
 	}
 
 	return kiteData, isNew, nil
@@ -348,33 +447,34 @@ func (m *Manager) GenerateSession() string {
 // No longer needed - replaced by GetOrCreateSession
 
 func (m *Manager) SessionLoginURL(mcpSessionID string) (string, error) {
-	if err := m.validateSessionID(mcpSessionID); err != nil {
-		m.Logger.Warn("SessionLoginURL called with empty MCP session ID")
-		return "", err
+	resolvedSessionID, err := m.resolveSessionID(mcpSessionID)
+	if err != nil {
+		m.Logger.Warn("SessionLoginURL called without a valid MCP session ID")
+		return "", ErrInvalidSessionID
 	}
 
-	m.Logger.Debug("Retrieving or creating Kite data for MCP session ID", "session_id", mcpSessionID)
+	m.Logger.Debug("Retrieving or creating Kite data for MCP session ID", "session_id", resolvedSessionID)
 	// Use GetOrCreateSession instead of GetSession to automatically create a session if needed
-	kiteData, isNew, err := m.GetOrCreateSession(mcpSessionID)
+	kiteData, isNew, err := m.GetOrCreateSession(resolvedSessionID)
 	if err != nil {
 		m.Logger.Error("Failed to get or create Kite data", "error", err)
 		return "", err
 	}
 
 	if isNew {
-		m.Logger.Info("Created new Kite session for MCP session ID", "session_id", mcpSessionID)
+		m.Logger.Info("Created new Kite session for MCP session ID", "session_id", resolvedSessionID)
 	}
 
 	// Create signed redirect parameters for security
-	signedParams, err := m.sessionSigner.SignRedirectParams(mcpSessionID)
+	signedParams, err := m.sessionSigner.SignRedirectParams(resolvedSessionID)
 	if err != nil {
-		m.Logger.Error("Failed to sign redirect params for session", "session_id", mcpSessionID, "error", err)
+		m.Logger.Error("Failed to sign redirect params for session", "session_id", resolvedSessionID, "error", err)
 		return "", fmt.Errorf("failed to create secure login URL: %w", err)
 	}
 
 	redirectParams := url.QueryEscape(signedParams)
 	loginURL := kiteData.Kite.Client.GetLoginURL() + "&redirect_params=" + redirectParams
-	m.Logger.Info("Generated Kite login URL for MCP session", "session_id", mcpSessionID)
+	m.Logger.Info("Generated Kite login URL for MCP session", "session_id", resolvedSessionID)
 
 	return loginURL, nil
 }
@@ -417,6 +517,10 @@ func (m *Manager) CompleteSession(mcpSessionID, kiteRequestToken string) error {
 	if m.metrics != nil {
 		m.metrics.TrackDailyUser(userSess.UserID)
 		m.metrics.Increment("user_logins")
+	}
+
+	if err := m.saveSessionIDToFile(mcpSessionID); err != nil {
+		m.Logger.Warn("Failed to persist MCP session ID after successful login", "session_id", mcpSessionID, "error", err)
 	}
 
 	return nil

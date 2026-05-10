@@ -70,24 +70,28 @@ func (h *ToolHandler) trackToolError(ctx context.Context, toolName, errorType st
 // This eliminates the TOCTOU race condition by consolidating session validation and usage
 func (h *ToolHandler) WithSession(ctx context.Context, toolName string, fn func(*kc.KiteSessionData) (*mcp.CallToolResult, error)) (*mcp.CallToolResult, error) {
 	sess := server.ClientSessionFromContext(ctx)
-	sessionID := sess.SessionID()
+	incomingSessionID := sess.SessionID()
+	effectiveSessionID, resolveErr := h.manager.ResolveSessionID(incomingSessionID)
+	if resolveErr != nil {
+		effectiveSessionID = incomingSessionID
+	}
 
-	h.manager.Logger.Debug("Tool request with session", "tool", toolName, "session_id", sessionID)
+	h.manager.Logger.Debug("Tool request with session", "tool", toolName, "incoming_session_id", incomingSessionID, "effective_session_id", effectiveSessionID)
 
-	kiteSession, isNew, err := h.manager.GetOrCreateSession(sessionID)
+	kiteSession, isNew, err := h.manager.GetOrCreateSession(effectiveSessionID)
 	if err != nil {
-		h.manager.Logger.Error("Failed to establish session", "tool", toolName, "session_id", sessionID, "error", err)
+		h.manager.Logger.Error("Failed to establish session", "tool", toolName, "incoming_session_id", incomingSessionID, "effective_session_id", effectiveSessionID, "error", err)
 		h.trackToolError(ctx, toolName, "session_error")
 		return mcp.NewToolResultError("Failed to establish a session. Please try again."), nil
 	}
 
 	if isNew {
-		h.manager.Logger.Info("New session created, login required", "tool", toolName, "session_id", sessionID)
+		h.manager.Logger.Info("New session created, login required", "tool", toolName, "incoming_session_id", incomingSessionID, "effective_session_id", effectiveSessionID)
 		h.trackToolError(ctx, toolName, "auth_required")
 		return mcp.NewToolResultError("Please log in first using the login tool"), nil
 	}
 
-	h.manager.Logger.Debug("Session validated successfully", "tool", toolName, "session_id", sessionID)
+	h.manager.Logger.Debug("Session validated successfully", "tool", toolName, "incoming_session_id", incomingSessionID, "effective_session_id", effectiveSessionID)
 	return fn(kiteSession)
 }
 
